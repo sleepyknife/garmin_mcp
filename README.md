@@ -14,6 +14,7 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 - Access health metrics (steps, heart rate, sleep, stress, respiration)
 - View body composition data
 - Track training status and readiness
+- Recent training rollup: last N days of sessions, totals, per-sport breakdown, and rest days in one call
 - Access cycling FTP and lactate threshold metrics
 - Manage gear and equipment
 - Access workouts and training plans
@@ -29,7 +30,7 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 
 - ✅ Activity Management (20 tools) - includes write tools for type, description, event type, perceived effort, and feel
 - ✅ Health & Wellness (31 tools) - includes custom lightweight summary tools
-- ✅ Training & Performance (13 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends
+- ✅ Training & Performance (14 tools) - includes recent training rollup, CTL/ATL/TSB, HRV, VO2 max, and respiration trends
 - ✅ Workouts (8 tools)
 - ✅ Devices (7 tools)
 - ✅ Gear Management (5 tools)
@@ -44,6 +45,28 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 - ✅ Activity File Downloads (2 tools) - download activity files in FIT, GPX, TCX, or CSV format
 
 > **Note:** Activity Analysis tools require a compatible power meter (e.g., Garmin Rally, Favero Assioma, PowerTap P1) and/or Shimano Di2 / SRAM eTap electronic shifting. The `fitparse` dependency is installed automatically.
+
+### Recent Training Rollup
+
+`get_recent_training(days=7, activity_type="", max_activities=50, include_training_status=True)`
+answers "how has training been going lately?" in a single call. It returns:
+
+- **`sessions`** — completed sessions in the window, newest first, each with duration,
+  distance, heart rate, training load, and aerobic/anaerobic training effect.
+- **`summary`** — totals for duration, distance, calories and training load, average
+  aerobic training effect, a per-sport breakdown ordered by time spent, and how many of
+  the days were rest days.
+- **`training_status`** — the current training status and acute/chronic load snapshot
+  (omit with `include_training_status=False`).
+
+The window ends today and covers `days` calendar days inclusive (max 90). Use
+`get_activities_by_date` instead when you need a specific date range or pagination, and
+`get_training_load_trend` for day-by-day CTL/ATL/TSB.
+
+Fields Garmin did not report for a session are omitted rather than returned as null —
+training load and training effect are only present for activities recorded on a
+compatible device, so third-party imports (e.g. Peloton) contribute to session counts
+and duration but not to training load.
 
 ### Activity File Downloads
 
