@@ -7,11 +7,13 @@ import pytest
 from unittest.mock import Mock
 from mcp.server.fastmcp import FastMCP
 
+import datetime
 import json
 
 from garmin_mcp import training
 from tests.fixtures.garmin_responses import (
     MOCK_PROGRESS_SUMMARY,
+    MOCK_RECENT_TRAINING_ACTIVITIES,
     MOCK_HRV_DATA,
     MOCK_TRAINING_STATUS,
     MOCK_LACTATE_THRESHOLD,
@@ -398,3 +400,227 @@ async def test_get_training_status_no_cycling_vo2_when_absent(app_with_training,
         assert "cycling_vo2_max_precise" not in data
     except (json.JSONDecodeError, AttributeError):
         assert "cycling_vo2_max" not in text
+
+
+# --- get_recent_training -----------------------------------------------------
+
+
+@pytest.fixture
+def recent_training_client(mock_garmin_client):
+    """Mock client wired for the activities endpoint used by get_recent_training"""
+    mock_garmin_client.garmin_connect_activities = "/activitylist-service/activities/search/activities"
+    mock_garmin_client.connectapi = Mock(return_value=MOCK_RECENT_TRAINING_ACTIVITIES)
+    mock_garmin_client.get_training_status = Mock(return_value=MOCK_TRAINING_STATUS)
+    return mock_garmin_client
+
+
+@pytest.fixture
+def app_with_recent_training(recent_training_client):
+    """FastMCP app registered against the recent-training mock client"""
+    training.configure(recent_training_client)
+    app = FastMCP("Test Recent Training")
+    return training.register_tools(app)
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_defaults(app_with_recent_training, recent_training_client):
+    """Default call returns a 7-day window ending today with a summary and sessions"""
+    result = await app_with_recent_training.call_tool("get_recent_training", {})
+
+    assert result is not None
+    data = json.loads(result[0][0].text)
+
+    assert data["date_range"]["days"] == 7
+    start = datetime.date.fromisoformat(data["date_range"]["start"])
+    end = datetime.date.fromisoformat(data["date_range"]["end"])
+    assert end == datetime.date.today()
+    assert (end - start).days == 6
+
+    # The endpoint is called once with the window and page size, not the
+    # library's auto-paginating helper.
+    recent_training_client.connectapi.assert_called_once()
+    _args, kwargs = recent_training_client.connectapi.call_args
+    assert kwargs["params"]["startDate"] == start.isoformat()
+    assert kwargs["params"]["endDate"] == end.isoformat()
+    assert kwargs["params"]["limit"] == "50"
+    assert "activityType" not in kwargs["params"]
+    recent_training_client.get_activities_by_date.assert_not_called()
+
+    assert data["truncated"] is False
+    assert len(data["sessions"]) == 3
+    assert data["sessions"][0]["name"] == "Tempo Run"
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_summary_totals(app_with_recent_training):
+    """Summary aggregates duration, distance, calories and load across sessions"""
+    result = await app_with_recent_training.call_tool("get_recent_training", {"days": 7})
+    data = json.loads(result[0][0].text)
+    summary = data["summary"]
+
+    assert summary["sessions"] == 3
+    # Two sessions fall on 2024-01-14, so three sessions span two calendar days.
+    assert summary["days_trained"] == 2
+    assert summary["rest_days"] == 5
+
+    assert summary["total_duration_seconds"] == 2700 + 5400 + 1800
+    assert summary["total_duration_hours"] == 2.75
+    assert summary["total_distance_meters"] == 55000
+    assert summary["total_distance_km"] == 55.0
+    assert summary["total_calories"] == 700 + 950 + 320
+    assert summary["total_training_load"] == 390.5
+    assert summary["avg_aerobic_training_effect"] == 3.5
+
+    # Ordered by total duration, longest first.
+    assert list(summary["by_activity_type"].keys()) == ["cycling", "running", "indoor_cycling"]
+    assert summary["by_activity_type"]["running"] == {
+        "sessions": 1,
+        "duration_seconds": 2700,
+        "distance_meters": 10000,
+        "training_load": 180.4,
+    }
+    # The Peloton import reports no distance or load, so those stay at zero.
+    assert summary["by_activity_type"]["indoor_cycling"]["distance_meters"] == 0
+    assert summary["by_activity_type"]["indoor_cycling"]["training_load"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_omits_missing_session_fields(app_with_recent_training):
+    """Fields Garmin did not report are omitted rather than returned as null"""
+    result = await app_with_recent_training.call_tool("get_recent_training", {})
+    sessions = json.loads(result[0][0].text)["sessions"]
+
+    tempo_run = sessions[0]
+    assert tempo_run["training_load"] == 180.4
+    assert tempo_run["aerobic_training_effect"] == 3.9
+    assert tempo_run["anaerobic_training_effect"] == 1.2
+    assert tempo_run["training_effect_label"] == "TEMPO"
+
+    peloton = sessions[2]
+    assert peloton["type"] == "indoor_cycling"
+    assert "training_load" not in peloton
+    assert "aerobic_training_effect" not in peloton
+    assert "distance_meters" not in peloton
+    assert "avg_hr_bpm" not in peloton
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_includes_training_status(app_with_recent_training, recent_training_client):
+    """Training status snapshot is attached for the last day of the window"""
+    result = await app_with_recent_training.call_tool("get_recent_training", {})
+    data = json.loads(result[0][0].text)
+
+    recent_training_client.get_training_status.assert_called_once_with(
+        datetime.date.today().isoformat()
+    )
+    status = data["training_status"]
+    assert status["training_status"] == "PRODUCTIVE"
+    assert status["acute_load"] == 250
+    assert status["chronic_load"] == 220
+    assert status["load_ratio"] == 1.14
+    assert status["acwr_status"] == "OPTIMAL"
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_can_skip_training_status(app_with_recent_training, recent_training_client):
+    """include_training_status=False skips the extra API call"""
+    result = await app_with_recent_training.call_tool(
+        "get_recent_training", {"include_training_status": False}
+    )
+    data = json.loads(result[0][0].text)
+
+    assert "training_status" not in data
+    recent_training_client.get_training_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_tolerates_training_status_failure(
+    app_with_recent_training, recent_training_client
+):
+    """A failing training status call does not fail the whole tool"""
+    recent_training_client.get_training_status.side_effect = Exception("503 Server Error")
+
+    result = await app_with_recent_training.call_tool("get_recent_training", {})
+    data = json.loads(result[0][0].text)
+
+    assert "training_status" not in data
+    assert data["summary"]["sessions"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_filters_by_activity_type(app_with_recent_training, recent_training_client):
+    """activity_type is passed through to the endpoint and echoed in the result"""
+    recent_training_client.connectapi.return_value = [MOCK_RECENT_TRAINING_ACTIVITIES[0]]
+
+    result = await app_with_recent_training.call_tool(
+        "get_recent_training", {"days": 14, "activity_type": "running"}
+    )
+    data = json.loads(result[0][0].text)
+
+    _args, kwargs = recent_training_client.connectapi.call_args
+    assert kwargs["params"]["activityType"] == "running"
+    assert data["activity_type_filter"] == "running"
+    assert data["date_range"]["days"] == 14
+    assert data["summary"]["rest_days"] == 13
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_flags_truncation(app_with_recent_training, recent_training_client):
+    """A full page signals there may be more sessions in the window"""
+    recent_training_client.connectapi.return_value = MOCK_RECENT_TRAINING_ACTIVITIES[:2]
+
+    result = await app_with_recent_training.call_tool(
+        "get_recent_training", {"max_activities": 2}
+    )
+    data = json.loads(result[0][0].text)
+
+    _args, kwargs = recent_training_client.connectapi.call_args
+    assert kwargs["params"]["limit"] == "2"
+    assert data["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_clamps_max_activities(app_with_recent_training, recent_training_client):
+    """max_activities is clamped to the endpoint's 200 ceiling"""
+    await app_with_recent_training.call_tool("get_recent_training", {"max_activities": 5000})
+
+    _args, kwargs = recent_training_client.connectapi.call_args
+    assert kwargs["params"]["limit"] == "200"
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_rejects_out_of_range_days(app_with_recent_training, recent_training_client):
+    """Windows outside 1..90 days are rejected before any API call"""
+    for days in (0, 91):
+        result = await app_with_recent_training.call_tool("get_recent_training", {"days": days})
+        text = result[0][0].text
+        assert "days" in text.lower() or "maximum" in text.lower()
+
+    recent_training_client.connectapi.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_no_activities(app_with_recent_training, recent_training_client):
+    """An empty window returns a zeroed summary rather than an error"""
+    recent_training_client.connectapi.return_value = []
+
+    result = await app_with_recent_training.call_tool("get_recent_training", {"days": 3})
+    data = json.loads(result[0][0].text)
+
+    assert data["sessions"] == []
+    assert data["summary"]["sessions"] == 0
+    assert data["summary"]["days_trained"] == 0
+    assert data["summary"]["rest_days"] == 3
+    assert data["summary"]["total_training_load"] == 0
+    assert "avg_aerobic_training_effect" not in data["summary"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_training_api_error(app_with_recent_training, recent_training_client):
+    """API failures surface as an error message, not an exception"""
+    recent_training_client.connectapi.side_effect = Exception("401 Unauthorized")
+
+    result = await app_with_recent_training.call_tool("get_recent_training", {})
+
+    assert "Error retrieving recent training" in result[0][0].text
+    assert "401 Unauthorized" in result[0][0].text

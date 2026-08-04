@@ -69,6 +69,54 @@ def _map_contributor(
     return result
 
 
+def _training_status_snapshot(date: str) -> Optional[Dict[str, Any]]:
+    """Fetch a compact training status snapshot for a date.
+
+    Returns only the load/status headline fields, not the full payload exposed by
+    get_training_status. Returns None when Garmin has no status for the date — a
+    normal case early in the day before the watch has synced.
+    """
+    try:
+        status = garmin_client.get_training_status(date)
+    except Exception:
+        return None
+
+    if not status:
+        return None
+
+    # Use `(x.get(key) or {})` so explicit nulls in the response are treated as
+    # missing rather than raising on the next .get().
+    recent_status = status.get("mostRecentTrainingStatus") or {}
+    latest_data = recent_status.get("latestTrainingStatusData") or {}
+
+    # Take the first device entry, which is the primary device.
+    device_data: Dict[str, Any] = {}
+    for _device_id, data in latest_data.items():
+        device_data = data or {}
+        break
+
+    acwr_data = device_data.get("acuteTrainingLoadDTO") or {}
+
+    snapshot = {
+        "date": device_data.get("calendarDate", date),
+        "training_status": device_data.get("trainingStatus"),
+        "training_status_feedback": device_data.get("trainingStatusFeedbackPhrase"),
+        "fitness_trend": device_data.get("fitnessTrend"),
+        "acute_load": acwr_data.get("dailyTrainingLoadAcute"),
+        "chronic_load": acwr_data.get("dailyTrainingLoadChronic"),
+        "load_ratio": acwr_data.get("dailyAcuteChronicWorkloadRatio"),
+        "acwr_status": acwr_data.get("acwrStatus"),
+    }
+
+    snapshot = {k: v for k, v in snapshot.items() if v is not None}
+
+    # Only "date" survived, so there is nothing worth reporting.
+    if len(snapshot) <= 1:
+        return None
+
+    return snapshot
+
+
 def register_tools(app):
     """Register all training-related tools with the MCP server app"""
 
@@ -1115,5 +1163,189 @@ def register_tools(app):
             "period_avg_sleep_breaths_per_min": avg_sleep_overall,
             "trend": trend,
         }, indent=2)
+
+    @app.tool()
+    async def get_recent_training(
+        days: int = 7,
+        activity_type: str = "",
+        max_activities: int = 50,
+        include_training_status: bool = True,
+    ) -> str:
+        """Get recent training sessions plus a rollup of the period, in one call.
+
+        This is the "how has training been going lately?" entry point. It returns
+        the completed sessions from the last N days (newest first), per-session
+        training effect and load, aggregate totals, a per-sport breakdown, and how
+        many of those days were rest days. Prefer this over calling
+        get_activities + get_training_status separately for a recent-training
+        overview; use get_activities_by_date when you need a specific date range or
+        pagination, and get_training_load_trend for day-by-day CTL/ATL/TSB.
+
+        The window ends today and covers `days` calendar days inclusive, so the
+        default of 7 means today plus the previous 6 days.
+
+        Sessions are what Garmin recorded, so manually created activities and
+        third-party imports (e.g. Peloton) are included. Fields that Garmin did not
+        report for a session are omitted rather than returned as null — training
+        effect and training load in particular are only present for activities
+        recorded with a compatible device.
+
+        Args:
+            days: Size of the window in days, ending today (default 7, max 90)
+            activity_type: Optional activity type filter (e.g., running, cycling, swimming)
+            max_activities: Maximum sessions to return, newest first (default 50, max 200)
+            include_training_status: Include the current training status / acute-chronic
+                load snapshot alongside the sessions (default True)
+        """
+        MAX_DAYS = 90
+
+        if days < 1:
+            return "days must be at least 1."
+        if days > MAX_DAYS:
+            return f"Window too large ({days} days). Maximum is {MAX_DAYS} days."
+
+        max_activities = min(max(1, max_activities), 200)
+
+        end = datetime.date.today()
+        start = end - datetime.timedelta(days=days - 1)
+
+        try:
+            # Call the activities endpoint directly rather than the library's
+            # get_activities_by_date, which loops until it has fetched every
+            # matching activity and can blow past the tool result size limit.
+            params: Dict[str, Any] = {
+                "startDate": start.isoformat(),
+                "endDate": end.isoformat(),
+                "start": "0",
+                "limit": str(max_activities),
+            }
+            if activity_type:
+                params["activityType"] = activity_type
+
+            activities = garmin_client.connectapi(
+                garmin_client.garmin_connect_activities,
+                params=params,
+            ) or []
+        except Exception as e:
+            return f"Error retrieving recent training: {str(e)}"
+
+        if not isinstance(activities, list):
+            return "Unexpected response format from the activities endpoint."
+
+        sessions: List[Dict[str, Any]] = []
+        by_type: Dict[str, Dict[str, Any]] = {}
+        days_trained = set()
+        totals = {
+            "duration_seconds": 0.0,
+            "distance_meters": 0.0,
+            "calories": 0.0,
+            "training_load": 0.0,
+        }
+        aerobic_te_values: List[float] = []
+
+        for a in activities:
+            type_key = (a.get("activityType") or {}).get("typeKey") or "unknown"
+            start_time = a.get("startTimeLocal")
+            duration = a.get("duration")
+            distance = a.get("distance")
+            calories = a.get("calories")
+            load = a.get("activityTrainingLoad")
+            aerobic_te = a.get("aerobicTrainingEffect")
+
+            session = {
+                "id": a.get("activityId"),
+                "name": a.get("activityName"),
+                "type": type_key,
+                "event_type": (a.get("eventType") or {}).get("typeKey"),
+                "start_time": start_time,
+                "duration_seconds": duration,
+                "distance_meters": distance,
+                "calories": calories,
+                "avg_hr_bpm": a.get("averageHR"),
+                "max_hr_bpm": a.get("maxHR"),
+                "elevation_gain_meters": a.get("elevationGain"),
+                "training_load": round(load, 1) if load is not None else None,
+                "aerobic_training_effect": (
+                    round(aerobic_te, 1) if aerobic_te is not None else None
+                ),
+                "anaerobic_training_effect": (
+                    round(a["anaerobicTrainingEffect"], 1)
+                    if a.get("anaerobicTrainingEffect") is not None
+                    else None
+                ),
+                "training_effect_label": a.get("trainingEffectLabel"),
+            }
+            sessions.append({k: v for k, v in session.items() if v is not None})
+
+            if duration is not None:
+                totals["duration_seconds"] += duration
+            if distance is not None:
+                totals["distance_meters"] += distance
+            if calories is not None:
+                totals["calories"] += calories
+            if load is not None:
+                totals["training_load"] += load
+            if aerobic_te is not None:
+                aerobic_te_values.append(aerobic_te)
+
+            if start_time:
+                days_trained.add(start_time[:10])
+
+            bucket = by_type.setdefault(
+                type_key,
+                {"sessions": 0, "duration_seconds": 0.0, "distance_meters": 0.0, "training_load": 0.0},
+            )
+            bucket["sessions"] += 1
+            if duration is not None:
+                bucket["duration_seconds"] += duration
+            if distance is not None:
+                bucket["distance_meters"] += distance
+            if load is not None:
+                bucket["training_load"] += load
+
+        summary: Dict[str, Any] = {
+            "sessions": len(sessions),
+            "days_trained": len(days_trained),
+            "rest_days": days - len(days_trained),
+            "total_duration_seconds": round(totals["duration_seconds"]),
+            "total_duration_hours": round(totals["duration_seconds"] / 3600, 2),
+            "total_distance_meters": round(totals["distance_meters"]),
+            "total_distance_km": round(totals["distance_meters"] / 1000, 2),
+            "total_calories": round(totals["calories"]),
+            "total_training_load": round(totals["training_load"], 1),
+            "avg_aerobic_training_effect": (
+                round(sum(aerobic_te_values) / len(aerobic_te_values), 1)
+                if aerobic_te_values
+                else None
+            ),
+            "by_activity_type": {
+                type_key: {
+                    "sessions": stats["sessions"],
+                    "duration_seconds": round(stats["duration_seconds"]),
+                    "distance_meters": round(stats["distance_meters"]),
+                    "training_load": round(stats["training_load"], 1),
+                }
+                for type_key, stats in sorted(
+                    by_type.items(), key=lambda item: item[1]["duration_seconds"], reverse=True
+                )
+            },
+        }
+        summary = {k: v for k, v in summary.items() if v is not None}
+
+        result: Dict[str, Any] = {
+            "date_range": {"start": start.isoformat(), "end": end.isoformat(), "days": days},
+            "truncated": len(sessions) == max_activities,
+            "summary": summary,
+            "sessions": sessions,
+        }
+        if activity_type:
+            result["activity_type_filter"] = activity_type
+
+        if include_training_status:
+            snapshot = _training_status_snapshot(end.isoformat())
+            if snapshot is not None:
+                result["training_status"] = snapshot
+
+        return json.dumps(result, indent=2)
 
     return app

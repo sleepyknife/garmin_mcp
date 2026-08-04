@@ -35,6 +35,57 @@ MOCK_ACTIVITIES = [
     }
 ]
 
+# Activities as returned by the activities endpoint for a recent-training window,
+# including the training effect / training load fields that only appear for
+# activities recorded on a compatible device.
+MOCK_RECENT_TRAINING_ACTIVITIES = [
+    {
+        "activityId": 22222222203,
+        "activityName": "Tempo Run",
+        "activityType": {"typeKey": "running", "typeId": 1},
+        "eventType": {"typeKey": "training", "typeId": 6},
+        "startTimeLocal": "2024-01-15 07:00:00",
+        "distance": 10000.0,
+        "duration": 2700.0,
+        "calories": 700,
+        "averageHR": 158,
+        "maxHR": 178,
+        "elevationGain": 85.0,
+        "activityTrainingLoad": 180.44,
+        "aerobicTrainingEffect": 3.85,
+        "anaerobicTrainingEffect": 1.22,
+        "trainingEffectLabel": "TEMPO",
+    },
+    {
+        "activityId": 22222222202,
+        "activityName": "Endurance Ride",
+        "activityType": {"typeKey": "cycling", "typeId": 2},
+        "eventType": {"typeKey": "training", "typeId": 6},
+        "startTimeLocal": "2024-01-14 16:00:00",
+        "distance": 45000.0,
+        "duration": 5400.0,
+        "calories": 950,
+        "averageHR": 132,
+        "maxHR": 160,
+        "elevationGain": 320.0,
+        "activityTrainingLoad": 210.06,
+        "aerobicTrainingEffect": 3.15,
+        "anaerobicTrainingEffect": 0.4,
+        "trainingEffectLabel": "BASE",
+    },
+    {
+        # Second run on the same calendar date as the ride, and a third-party
+        # import with no training effect / load reported.
+        "activityId": 22222222201,
+        "activityName": "Peloton Cycling",
+        "activityType": {"typeKey": "indoor_cycling", "typeId": 25},
+        "eventType": {"typeKey": "uncategorized", "typeId": 9},
+        "startTimeLocal": "2024-01-14 06:30:00",
+        "duration": 1800.0,
+        "calories": 320,
+    },
+]
+
 MOCK_ACTIVITY_DETAILS = {
     "activityId": 12345678901,
     "activityName": "Morning Run",
